@@ -1,0 +1,16 @@
+#!/usr/bin/env perl
+
+use 5.010;
+use strict;
+use warnings;
+use FindBin '$Bin';
+
+use Benchmark::Command;
+
+Benchmark::Command::run(0, {
+    'perl'             => [$^X, "-I$Bin/../lib", "-e1"],
+    'load_gl'          => [$^X, "-MGetopt::Long", "-e1"],
+    'load_gl_less'     => [$^X, "-MGetopt::Long::Less", "-e1"],
+    'load_gl_evenless' => [$^X, "-MGetopt::Long::EvenLess", "-e1"],
+    'load_perisgetopt' => [$^X, "-I$Bin/../lib", "-MPerinci::Sub::Getopt", "-e1"],
+});
