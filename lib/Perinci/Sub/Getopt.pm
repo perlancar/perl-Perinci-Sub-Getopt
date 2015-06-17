@@ -8,7 +8,7 @@ use strict 'subs', 'vars';
 use warnings; # COMMENT
 
 our @EXPORT = qw();
-our @EXPORT_OK = qw(get_options);
+our @EXPORT_OK = qw(get_args_from_argv);
 our %SPEC;
 
 sub import {
@@ -24,7 +24,7 @@ sub import {
     }
 }
 
-$SPEC{get_options} = {
+$SPEC{get_args_from_argv} = {
     v => 1.1,
     summary => 'Get command-line options with specification '.
         'from Rinci function metadata',
@@ -34,135 +34,119 @@ $SPEC{get_options} = {
             schema  => 'hash*',
             req => 1,
         },
+        argv => {
+            summary => 'Input array, defaults to @ARGV',
+            schema => ['array*', of=>'str*'],
+        },
         args => {
             summary => 'Hash to store resulting options in',
             schema => 'hash*',
         },
     },
 };
-sub get_options {
-    my $argv = shift;
+sub get_args_from_argv {
+    my %ga_args = @_;
 
-    my $vals;
-    my $spec;
+    my $meta = $ga_args{meta};
+    my $args_prop = $meta->{args} // {};
+    my $argv = $ga_args{argv} // \@ARGV;
+    my $args = $ga_args{args} // {};
 
-    # if next argument is a hashref, it means user wants to store values in this
-    # hash. and the spec is a list.
-    if (ref($_[0]) eq 'HASH') {
-        $vals = shift;
-        $spec = {map { $_ => sub { $vals->{ $_[0]->name } = $_[1] } } @_};
-    } else {
-        $spec = {@_};
-    }
+    my %optspecs;
+    my %opthandlers;
 
-    # parse option spec
-    my %parsed_spec;
-    for my $k (keys %$spec) {
-        my $parsed = parse_getopt_long_opt_spec($k)
-            or die "Error in option spec: $k\n";
-        if (defined $parsed->{max_vals}) {
-            die "Cannot repeat while bundling: $k\n";
+    # XXX add common options
+
+    for my $argname (sort keys %$args_prop) {
+        my $argspec = $args_prop->{$argname};
+        my $optname = $argname; $optname =~ s/[A-Z0-9.]+/-/g;
+
+        # XXX handle clash
+        #while ($optspecs{$optname}) {
+        #    $optspecs{$optname} =
+        #}
+        my $req_arg = 1;
+        $req_arg = 0 if $argspec->{schema} &&
+            $argspec->{schema}[0] eq 'bool' && $argspec->{schema}[1]{is};
+        $optspecs{$optname} = {
+            arg => $argname,
+            req_arg => $req_arg,
+        };
+        # XXX add fqarg
+        # XXX add is_neg, neg_opts, pos_opts
+
+        # XXX add negated options for bool arg
+        # XXX add json & yaml for non-simple arg
+        # XXX add base64 for binary arg
+
+        if (my $als = $argspec->{cmdline_aliases}) {
+            for my $alname (sort keys %$als) {
+                my $alspec = $als->{$alname};
+                # XXX handle clash
+                my $al_req_arg;
+                if ($alspec->{is_flag}) {
+                    $al_req_arg = 0;
+                } elsif ($alspec->{schema} &&
+                             $alspec->{schema}[0] eq 'bool' && $alspec->{schema}[1]{is}) {
+                    $al_req_arg = 0;
+                } elsif ($alspec->{schema}) {
+                    $al_req_arg = 1;
+                }
+                $optspecs{$alname} = {
+                    is_alias => 1,
+                    arg => $argname,
+                    req_arg => $al_req_arg // $req_arg,
+                    is_code => $alspec->{code} ? 1:0,
+                };
+                $opthandlers{$alname} = $alspec->{code} if $alspec->{code};
+            }
+            # XXX add noncode_aliases
         }
-        $parsed->{_orig} = $k;
-        $parsed_spec{$parsed->{opts}[0]} = $parsed;
     }
-    my @parsed_spec_opts = sort keys %parsed_spec;
+
+    my @optnames = sort keys %optspecs;
 
     my $success = 1;
 
     my $code_find_opt = sub {
         my ($wanted, $short_mode) = @_;
         my @candidates;
-      OPT_SPEC:
-        for my $opt (@parsed_spec_opts) {
-            my $s = $parsed_spec{$opt};
-            for my $o0 (@{ $s->{opts} }) {
-                for my $o ($s->{is_neg} && length($o0) > 1 ?
-                               ($o0, "no$o0", "no-$o0") : ($o0)) {
-                    my $is_neg = $o0 ne $o;
-                    next if $short_mode && length($o) > 1;
-                    if ($o eq $wanted) {
-                        # perfect match, we immediately go with this one
-                        @candidates = ([$opt, $is_neg]);
-                        last OPT_SPEC;
-                    } elsif (index($o, $wanted) == 0) {
-                        # prefix match, collect candidates first
-                        push @candidates, [$opt, $is_neg];
-                        next OPT_SPEC;
-                    }
-                }
+      OPT:
+        for my $optname (@optnames) {
+            my $optspec = $optspecs{$optname};
+            next if $short_mode && length($optname) > 1;
+            if ($optname eq $wanted) {
+                # perfect match, we immediately go with this one
+                @candidates = ($optname);
+                last OPT;
+            } elsif (index($optname, $wanted) == 0) {
+                # prefix match, collect candidates first
+                push @candidates, $optname;
             }
         }
         if (!@candidates) {
             warn "Unknown option: $wanted\n";
             $success = 0;
-            return (undef, undef);
+            return undef; # means not found
         } elsif (@candidates > 1) {
             warn "Option $wanted is ambiguous (" .
                 join(", ", map {$_->[0]} @candidates) . ")\n";
             $success = 0;
-            return (undef, undef, 1);
+            return ''; # means ambiguous
         }
-        return @{ $candidates[0] };
+        return $candidates[0];
     };
 
     my $code_set_val = sub {
-        my $is_neg = shift;
-        my $name   = shift;
+        my $optname = shift;
 
-        my $parsed   = $parsed_spec{$name};
-        my $spec_key = $parsed->{_orig};
-        my $handler  = $spec->{$spec_key};
-        my $ref      = ref($handler);
+        my $val = @_ ? $_[0] : 1;
 
-        my $val;
-        if (@_) {
-            $val = shift;
+        if ($opthandlers{$optname}) {
+            $opthandlers{$optname}->($val);
         } else {
-            if ($parsed->{is_inc} && $ref eq 'SCALAR') {
-                $val = ($$handler // 0) + 1;
-            } elsif ($parsed->{is_inc} && $vals) {
-                $val = ($vals->{$name} // 0) + 1;
-            } elsif ($parsed->{type} && $parsed->{type} eq 'i' ||
-                         $parsed->{opttype} && $parsed->{opttype} eq 'i') {
-                $val = 0;
-            } elsif ($parsed->{type} && $parsed->{type} eq 'f' ||
-                         $parsed->{opttype} && $parsed->{opttype} eq 'f') {
-                $val = 0;
-            } elsif ($parsed->{type} && $parsed->{type} eq 's' ||
-                         $parsed->{opttype} && $parsed->{opttype} eq 's') {
-                $val = '';
-            } else {
-                $val = $is_neg ? 0 : 1;
-            }
+            $args->{$optname} = $val;
         }
-
-        # type checking
-        if ($parsed->{type} && $parsed->{type} eq 'i' ||
-                $parsed->{opttype} && $parsed->{opttype} eq 'i') {
-            unless ($val =~ /\A[+-]?\d+\z/) {
-                warn qq|Value "$val" invalid for option $name (number expected)\n|;
-                return 0;
-            }
-        } elsif ($parsed->{type} && $parsed->{type} eq 'f' ||
-                $parsed->{opttype} && $parsed->{opttype} eq 'f') {
-            unless ($val =~ /\A[+-]?(\d+(\.\d+)?|\.\d+)([Ee][+-]?\d+)?\z/) {
-                warn qq|Value "$val" invalid for option $name (number expected)\n|;
-                return 0;
-            }
-        }
-
-        if ($ref eq 'CODE') {
-            my $cb = Getopt::Long::Less::Callback->new(
-                name => $name,
-            );
-            $handler->($cb, $val);
-        } elsif ($ref eq 'SCALAR') {
-            $$handler = $val;
-        } else {
-            # no nothing
-        }
-        1;
     };
 
     my $i = -1;
@@ -176,51 +160,40 @@ sub get_options {
 
         } elsif ($argv->[$i] =~ /\A--(.+?)(?:=(.*))?\z/) {
 
-            my ($used_name, $val_in_opt) = ($1, $2);
-            my ($opt, $is_neg, $is_ambig) = $code_find_opt->($used_name);
-            unless (defined $opt) {
-                push @remaining, $argv->[$i] unless $is_ambig;
-                next ELEM;
+            my ($used_optname, $val_in_opt) = ($1, $2);
+            my $optname = $code_find_opt->($used_optname);
+            if (!defined($optname)) {
+                $success = 0;
+                push @remaining, $argv->[$i];
+            } elsif (!length($optname)) {
+                $success = 0;
+                next ELEM; # ambiguous
             }
 
-            my $spec = $parsed_spec{$opt};
-            # check whether option requires an argument
-            if ($spec->{type} ||
-                    $spec->{opttype} &&
-                    (defined($val_in_opt) && length($val_in_opt) || ($i+1 < @$argv && $argv->[$i+1] !~ /\A-/))) {
+            my $optspec = $optspecs{$optname};
+            if ($optspec->{req_arg}) {
                 if (defined($val_in_opt)) {
                     # argument is taken after =
                     if (length $val_in_opt) {
-                        unless ($code_set_val->($is_neg, $opt, $val_in_opt)) {
-                            $success = 0;
-                            next ELEM;
-                        }
+                        $code_set_val->($optname, $val_in_opt);
                     } else {
-                        warn "Option $used_name requires an argument\n";
+                        warn "Option $used_optname requires an argument\n";
                         $success = 0;
                         next ELEM;
                     }
                 } else {
                     if ($i+1 >= @$argv) {
                         # we are the last element
-                        warn "Option $used_name requires an argument\n";
+                        warn "Option $used_optname requires an argument\n";
                         $success = 0;
                         last ELEM;
                     }
                     # take the next element as argument
-                    if ($spec->{type} || $argv->[$i+1] !~ /\A-/) {
-                        $i++;
-                        unless ($code_set_val->($is_neg, $opt, $argv->[$i])) {
-                            $success = 0;
-                            next ELEM;
-                        }
-                    }
+                    $i++;
+                    $code_set_val->($optname, $argv->[$i]);
                 }
             } else {
-                unless ($code_set_val->($is_neg, $opt)) {
-                    $success = 0;
-                    next ELEM;
-                }
+                $code_set_val->($optname);
             }
 
         } elsif ($argv->[$i] =~ /\A-(.*)/) {
@@ -228,44 +201,28 @@ sub get_options {
             my $str = $1;
           SHORT_OPT:
             while ($str =~ s/(.)//) {
-                my $used_name = $1;
-                my ($opt, $is_neg) = $code_find_opt->($1, 'short');
-                next SHORT_OPT unless defined $opt;
+                my $used_optname = $1;
+                my $optname = $code_find_opt->($1, 'short');
+                next SHORT_OPT unless defined($optname) && length($optname);
 
-                my $spec = $parsed_spec{$opt};
-                # check whether option requires an argument
-                if ($spec->{type} ||
-                        $spec->{opttype} &&
-                        (length($str) || ($i+1 < @$argv && $argv->[$i+1] !~ /\A-/))) {
+                my $optspec = $optspecs{$optname};
+                if ($optspec->{req_arg}) {
                     if (length $str) {
                         # argument is taken from $str
-                        if ($code_set_val->($is_neg, $opt, $str)) {
-                            next ELEM;
-                        } else {
-                            $success = 0;
-                            next SHORT_OPT;
-                        }
+                        $code_set_val->($optname, $str);
                     } else {
                         if ($i+1 >= @$argv) {
                             # we are the last element
-                            warn "Option $used_name requires an argument\n";
+                            warn "Option $used_optname requires an argument\n";
                             $success = 0;
                             last ELEM;
                         }
                         # take the next element as argument
-                        if ($spec->{type} || $argv->[$i+1] !~ /\A-/) {
-                            $i++;
-                            unless ($code_set_val->($is_neg, $opt, $argv->[$i])) {
-                                $success = 0;
-                                next ELEM;
-                            }
-                        }
+                        $i++;
+                        $code_set_val->($optname, $argv->[$i]);
                     }
                 } else {
-                    unless ($code_set_val->($is_neg, $opt)) {
-                        $success = 0;
-                        next SHORT_OPT;
-                    }
+                    $code_set_val->($optname);
                 }
             }
 
@@ -279,7 +236,12 @@ sub get_options {
 
   RETURN:
     splice @$argv, 0, ~~@$argv, @remaining; # replace with remaining elements
-    return $success;
+    return [
+        $success ? 200:500,
+        $success ? "OK":"Failed",
+        $args,
+        {"func.remaining_argv" => $argv},
+    ];
 }
 
 1;
@@ -287,10 +249,8 @@ sub get_options {
 
 =head1 DESCRIPTION
 
-# COMMAND: perl devscripts/bench-startup 2>&1
+# COMMAND: perl devscripts/bench-startup
 
 =head1 SEE ALSO
-
-L<Getopt::Long>
 
 =cut
