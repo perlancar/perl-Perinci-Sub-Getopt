@@ -5,7 +5,9 @@ package Perinci::Sub::Getopt;
 
 use 5.010001;
 use strict 'subs', 'vars';
-use warnings; # COMMENT
+# IFUNBUILT
+use warnings;
+# END IFUNBUILT
 
 our @EXPORT = qw();
 our @EXPORT_OK = qw(get_args_from_argv);
